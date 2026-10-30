@@ -1,0 +1,40 @@
+name: Security Audit
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+jobs:
+  audit:
+    name: Scan and upload SARIF
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Run security scanner
+        run: |
+          python scanner.py . audit_report.json \
+            --markdown-report audit_report.md \
+            --sarif-report audit_report.sarif
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: audit_report.sarif
+          category: codebase-security-auditor
