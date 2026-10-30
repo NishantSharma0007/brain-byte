@@ -19,6 +19,16 @@ VULNERABLE_CASES = [
         "path": "benchmarks/py_vulnerable",
         "expected_rule": "PY-CMD-001",
     },
+    {
+        "name": "JavaScript cross-file vulnerable",
+        "path": "benchmarks/js_cross_file",
+        "expected_rule": "JS-CMD-001",
+        "expected_evidence": [
+            "Web request data source at line 4.",
+            "Cross-file call from route.js",
+            "child_process shell sink at line 4.",
+        ],
+    },
 ]
 
 SAFE_CASES = [
@@ -39,7 +49,7 @@ RULE_PATTERN = re.compile(
 
 
 def scan_example(example_path):
-    """Scanner chala kar report mein aaye code rule IDs return karta hai."""
+    """Scanner chala kar code rule IDs aur console evidence return karta hai."""
     project_path = PROJECT_ROOT / example_path
 
     if not project_path.is_dir():
@@ -79,7 +89,7 @@ def scan_example(example_path):
                 f"STDERR:\n{result.stderr}"
             )
 
-        return set(RULE_PATTERN.findall(result.stdout))
+        return set(RULE_PATTERN.findall(result.stdout)), result.stdout
 
 
 def percentage(numerator, denominator):
@@ -104,15 +114,23 @@ def main():
     print("Security auditor benchmark shuru...\n")
 
     for example in VULNERABLE_CASES:
-        found_rules = scan_example(example["path"])
+        found_rules, scan_output = scan_example(example["path"])
         expected_rule = example["expected_rule"]
+        expected_evidence = example.get("expected_evidence", [])
+        evidence_missing = [
+            item
+            for item in expected_evidence
+            if item not in scan_output
+        ]
 
-        if expected_rule in found_rules:
+        if expected_rule in found_rules and not evidence_missing:
             true_positives += 1
             result_label = "TP - expected vulnerability detect hui"
         else:
             false_negatives += 1
-            result_label = "FN - expected vulnerability detect nahi hui"
+            result_label = (
+                "FN - expected vulnerability ya required evidence missing"
+            )
 
         print(f'{example["name"]}: {result_label}')
         print(f"  Expected: {expected_rule}")
@@ -120,9 +138,14 @@ def main():
             "  Found: "
             + (", ".join(sorted(found_rules)) if found_rules else "koi code finding nahi")
         )
+        if evidence_missing:
+            print(
+                "  Missing evidence: "
+                + "; ".join(evidence_missing)
+            )
 
     for example in SAFE_CASES:
-        found_rules = scan_example(example["path"])
+        found_rules, _ = scan_example(example["path"])
 
         if found_rules:
             false_positives += 1
