@@ -51,10 +51,11 @@ def scan_project(project_folder, enable_ai=False, model=None):
         advisories,
     )
 
-    # Call graph abhi Python files ke liye hi banta hai.
+    # Python aur JavaScript files ke liye code call graph.
     code_graph = build_call_graph(
         project_folder,
         python_files,
+        javascript_files,
     )
 
     # Specialist agents ko dono languages ki findings do.
@@ -127,13 +128,40 @@ def scan_project(project_folder, enable_ai=False, model=None):
         if edge.get("type") == "CALLS"
     ]
 
+    python_function_ids = {
+        node.get("id")
+        for node in function_nodes
+        if node.get("language") == "python"
+    }
+    javascript_function_ids = {
+        node.get("id")
+        for node in function_nodes
+        if node.get("language") == "javascript"
+    }
+    python_call_count = sum(
+        edge.get("from") in python_function_ids
+        for edge in call_edges
+    )
+    javascript_call_count = sum(
+        edge.get("from") in javascript_function_ids
+        for edge in call_edges
+    )
+
     print(
         f"\nDependency graph bana: "
         f"{len(dependency_nodes)} nodes, {len(dependency_edges)} edges."
     )
     print(
-        f"Python call graph bana: "
+        f"Code call graph bana: "
         f"{len(function_nodes)} functions, {len(call_edges)} calls."
+    )
+    print(
+        f"  Python: {len(python_function_ids)} functions, "
+        f"{python_call_count} calls."
+    )
+    print(
+        f"  JavaScript: {len(javascript_function_ids)} functions, "
+        f"{javascript_call_count} calls."
     )
 
     # Agent results.
