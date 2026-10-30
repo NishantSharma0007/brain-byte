@@ -1,19 +1,20 @@
 # Automated Codebase Security Auditor
 
-A Python command-line prototype that scans a local codebase for selected security issues and known vulnerable dependencies. It can trace supported input-to-command flows, build code and dependency graphs, and produce evidence-linked reports.
+A Python command-line prototype that scans local codebases for selected security patterns and known vulnerable dependencies. It traces supported input-to-command flows, builds code and dependency graphs, and creates evidence-linked reports.
 
 ## Features
 
 - Scans Python and JavaScript files for selected security patterns.
-- Tracks selected tainted input flows, including supported JavaScript calls across named relative imports.
+- Tracks selected tainted input flows through supported function calls.
+- Supports JavaScript same-file flows and named relative CommonJS and ESM imports.
 - Reads pinned Python dependencies from `requirements*.txt` and npm dependencies from `package-lock.json`.
-- Checks dependency versions against OSV advisories.
+- Checks dependencies against OSV advisories.
 - Builds code call graphs and dependency graphs.
 - Coordinates rule-based code, dependency, and triage agents.
-- Optionally uses a locally running Ollama model to explain findings.
-- Creates JSON, Markdown, and SARIF reports.
-- Suggests reviewable dependency update patches and validates them in a temporary copy.
-- Runs a labeled benchmark from the command line and in GitHub Actions.
+- Optionally uses a local Ollama model to explain findings.
+- Produces JSON, Markdown, and SARIF reports.
+- Suggests dependency update patches and validates them in a temporary copy.
+- Runs labeled code and dependency benchmarks from the command line and GitHub Actions.
 
 ## Requirements
 
@@ -21,11 +22,11 @@ A Python command-line prototype that scans a local codebase for selected securit
 - Git
 - Network access for OSV advisory lookups
 - Node.js and npm for npm dependency patch suggestions
-- Ollama is optional and used only for local AI explanations
+- Ollama is optional and needed only for local AI explanations
 
 ## Installation
 
-From the project folder, create and activate a virtual environment, then install the project dependencies:
+From the project folder, create and activate a virtual environment, then install the auditor dependencies:
 
 ```powershell
 python -m venv .venv
@@ -35,10 +36,16 @@ python -m pip install -r requirements-auditor.txt
 
 ## Scan a Project
 
-Scan the included demo project:
+Scan the included Python demo project:
 
 ```powershell
 python scanner.py .\demo_project
+```
+
+Scan the included npm dependency demo:
+
+```powershell
+python scanner.py .\demo_npm
 ```
 
 To choose report paths explicitly:
@@ -49,17 +56,17 @@ python scanner.py .\demo_project audit_report.json `
   --sarif-report audit_report.sarif
 ```
 
-The scanner prints findings and saves JSON, Markdown, and SARIF reports. It needs network access to query OSV when pinned dependencies are present.
+The scanner prints findings and saves JSON, Markdown, and SARIF reports. OSV lookups need network access when pinned dependencies are present.
 
 ## Local AI Explanations
 
-Ollama is optional. Start Ollama and make sure the configured model is available, then run:
+Ollama is optional. Make sure Ollama is running and the configured model is available, then run:
 
 ```powershell
 python scanner.py .\demo_project --ai
 ```
 
-AI explanations provide context for findings; they do not prove that a finding is exploitable or that code is secure.
+AI explanations use the scanner's findings as input. They do not prove that a finding is exploitable or that an application is secure.
 
 ## Dependency Patch Suggestions
 
@@ -69,28 +76,33 @@ Generate a reviewable patch for the included Python demo:
 python patch_suggestions.py .\demo_project
 ```
 
-Validate the generated patch in a temporary copy:
+Validate the patch in a temporary copy:
 
 ```powershell
 python patch_validator.py .\demo_project .\dependency_update_suggestions.patch
 ```
 
-Patch validation checks whether the updated dependency still matches OSV advisories. It does not automatically prove project compatibility or run all project-specific tests. The original project files are not changed during validation. Review any generated patch before applying it.
+Validation checks whether the updated dependency still matches OSV advisories. It does not prove compatibility or automatically run all project-specific tests. The original project files are not changed during validation. Review any proposed patch before applying it.
 
-## Labeled Benchmark
+## Benchmarking
 
-Run the benchmark examples:
+Run the labeled examples with:
 
 ```powershell
 python benchmark.py
 ```
 
-The current benchmark contains five small examples:
+The benchmark evaluates code findings and dependency advisories separately:
 
-- Three vulnerable examples: Python, JavaScript, and JavaScript across two files.
-- Two safe examples: Python and JavaScript.
+- Code set: five examples—three vulnerable and two safe.
+- Dependency set: two examples—one vulnerable package and one updated package.
 
-A sample run produced `TP=3`, `TN=2`, `FP=0`, and `FN=0`. These results describe only the five included examples; they do not represent the scanner's general accuracy.
+The latest run produced:
+
+- Code: TP=3, TN=2, FP=0, FN=0.
+- Dependencies: TP=1, TN=1, FP=0, FN=0.
+
+These results describe only the included demo examples; they do not represent the scanner's general accuracy. Dependency benchmark results use live OSV data and require network access.
 
 ## GitHub Actions
 
@@ -105,6 +117,14 @@ The dependency draft pull request workflow can propose a reviewable dependency u
 ├── .github/
 │   └── workflows/
 ├── benchmarks/
+│   ├── dep_py_safe/
+│   ├── dep_py_vulnerable/
+│   ├── js_cross_file/
+│   ├── js_safe/
+│   ├── js_vulnerable/
+│   ├── py_safe/
+│   └── py_vulnerable/
+├── demo_npm/
 ├── demo_project/
 ├── agent_workflow.py
 ├── benchmark.py
@@ -127,10 +147,10 @@ The dependency draft pull request workflow can propose a reviewable dependency u
 
 ## Scope and Limitations
 
-- This is a prototype using selected rules, not a complete replacement for a dedicated SAST or software composition analysis platform.
+- This is a prototype that checks selected patterns; it is not a complete replacement for a dedicated SAST or software composition analysis platform.
 - Python code-flow analysis covers selected same-file patterns and calls.
 - JavaScript code-flow analysis covers selected same-file calls and nested closures, plus named relative CommonJS and ESM imports.
 - Dynamic imports, namespace or default imports, Python cross-file flows, and service-to-service data flows are not covered.
-- Dependency scanning depends on the supported manifests, package data, and OSV responses.
-- Findings and AI explanations require developer review. Passing the included benchmark does not guarantee that a codebase is secure.
-- The vulnerable examples are for scanning demonstrations. Do not run them as applications.
+- Dependency scanning depends on supported manifests, package data, and OSV responses.
+- Findings and AI explanations need developer review. Passing the included benchmark does not guarantee a codebase is secure.
+- The vulnerable examples are for scanner demonstrations. Do not run them as applications.
