@@ -2,8 +2,9 @@ import argparse
 import os
 from pathlib import Path
 
-from inventory import find_python_files
+from inventory import find_python_files, find_javascript_files
 from code_analysis import analyze_file
+from javascript_analysis import analyze_javascript_file
 from dependencies import parse_requirements
 from osv_lookup import lookup_osv
 from dependency_graph import build_dependency_graph
@@ -17,17 +18,24 @@ from sarif_reporting import save_sarif_report
 def scan_project(project_folder, enable_ai=False, model=None):
     project_folder = Path(project_folder).resolve()
 
-    # Python source files scan karo.
+    # Python aur JavaScript files alag dhoondho.
     python_files = find_python_files(project_folder)
+    javascript_files = find_javascript_files(project_folder)
     code_findings = []
 
     print(
-        f"{len(python_files)} Python files mili hain. "
+        f"{len(python_files)} Python file(s) aur "
+        f"{len(javascript_files)} JavaScript file(s) mili hain. "
         "Code scan shuru..."
     )
 
+    # Existing Python analyzer.
     for file_path in python_files:
         code_findings.extend(analyze_file(file_path))
+
+    # Tree-sitter JavaScript analyzer.
+    for file_path in javascript_files:
+        code_findings.extend(analyze_javascript_file(file_path))
 
     # Requirements aur lockfiles se packages padho.
     packages = parse_requirements(project_folder)
@@ -36,19 +44,20 @@ def scan_project(project_folder, enable_ai=False, model=None):
     # OSV advisory lookup.
     advisories, warnings = lookup_osv(packages)
 
-    # Dependency aur code call graphs.
+    # Dependency graph.
     dependency_graph = build_dependency_graph(
         project_folder,
         packages,
         advisories,
     )
 
+    # Call graph abhi Python files ke liye hi banta hai.
     code_graph = build_call_graph(
         project_folder,
         python_files,
     )
 
-    # Specialist agents chalao.
+    # Specialist agents ko dono languages ki findings do.
     agent_workflow = run_agent_workflow(
         code_findings,
         advisories,
@@ -123,7 +132,7 @@ def scan_project(project_folder, enable_ai=False, model=None):
         f"{len(dependency_nodes)} nodes, {len(dependency_edges)} edges."
     )
     print(
-        f"Code call graph bana: "
+        f"Python call graph bana: "
         f"{len(function_nodes)} functions, {len(call_edges)} calls."
     )
 
