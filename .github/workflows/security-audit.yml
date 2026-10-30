@@ -29,6 +29,9 @@ jobs:
       - name: Install auditor dependencies
         run: python -m pip install -r requirements-auditor.txt
 
+      - name: Run labeled security benchmark
+        run: python benchmark.py
+
       - name: Run security scanner
         run: |
           python scanner.py . audit_report.json \
