@@ -10,17 +10,33 @@ OSV_DETAIL_URL = "https://api.osv.dev/v1/vulns/"
 
 def get_advisory_details(advisory_id):
     url = OSV_DETAIL_URL + quote(advisory_id, safe="")
-    request = Request(url, headers={"User-Agent": "security-test-scanner"})
+    request = Request(
+        url,
+        headers={"User-Agent": "security-test-scanner"},
+    )
 
     with urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def unique_items(items):
+    result = []
+    seen = set()
+
+    for item in items:
+        key = json.dumps(item, sort_keys=True)
+
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+
+    return result
 
 
 def extract_severity(advisory):
     labels = []
     scores = []
 
-    # Kuch records severity ko text label mein rakhte hain.
     for affected in advisory.get("affected", []):
         for section_name in ("ecosystem_specific", "database_specific"):
             section = affected.get(section_name) or {}
@@ -29,7 +45,6 @@ def extract_severity(advisory):
             if isinstance(label, str):
                 labels.append(label.upper())
 
-        # Package-specific severity score, agar ho.
         for score in affected.get("severity", []):
             if score.get("type") and score.get("score"):
                 scores.append({
@@ -38,7 +53,6 @@ def extract_severity(advisory):
                     "source": score.get("source"),
                 })
 
-    # Vulnerability-level severity score, agar ho.
     for score in advisory.get("severity", []):
         if score.get("type") and score.get("score"):
             scores.append({
@@ -74,20 +88,6 @@ def extract_fixed_events(advisory):
     return unique_items(fixed_events)
 
 
-def unique_items(items):
-    result = []
-    seen = set()
-
-    for item in items:
-        key = json.dumps(item, sort_keys=True)
-
-        if key not in seen:
-            seen.add(key)
-            result.append(item)
-
-    return result
-
-
 def preferred_id(ids):
     priorities = {
         "GHSA": 0,
@@ -108,17 +108,20 @@ def merge_alias_duplicates(records):
     groups = []
 
     for record in records:
+        ecosystem = record.get("ecosystem", "PyPI")
         identifiers = {record["id"], *record.get("aliases", [])}
 
         matching_groups = [
             group for group in groups
-            if group["package"] == record["package"]
+            if group["ecosystem"] == ecosystem
+            and group["package"] == record["package"]
             and group["version"] == record["version"]
             and group["_identifiers"].intersection(identifiers)
         ]
 
         if not matching_groups:
             group = {
+                "ecosystem": ecosystem,
                 "package": record["package"],
                 "version": record["version"],
                 "source": record["source"],
@@ -133,14 +136,25 @@ def merge_alias_duplicates(records):
         else:
             group = matching_groups[0]
 
-            # Alias links can connect records already in separate groups.
             for other_group in matching_groups[1:]:
-                group["_identifiers"].update(other_group["_identifiers"])
-                group["_summaries"].extend(other_group["_summaries"])
-                group["_severity_labels"].extend(other_group["_severity_labels"])
-                group["_severity_scores"].extend(other_group["_severity_scores"])
-                group["_fixed_events"].extend(other_group["_fixed_events"])
-                group["_references"].extend(other_group["_references"])
+                group["_identifiers"].update(
+                    other_group["_identifiers"]
+                )
+                group["_summaries"].extend(
+                    other_group["_summaries"]
+                )
+                group["_severity_labels"].extend(
+                    other_group["_severity_labels"]
+                )
+                group["_severity_scores"].extend(
+                    other_group["_severity_scores"]
+                )
+                group["_fixed_events"].extend(
+                    other_group["_fixed_events"]
+                )
+                group["_references"].extend(
+                    other_group["_references"]
+                )
                 groups.remove(other_group)
 
         group["_identifiers"].update(identifiers)
@@ -151,20 +165,32 @@ def merge_alias_duplicates(records):
         if record.get("severity") != "Not provided":
             group["_severity_labels"].append(record["severity"])
 
-        group["_severity_scores"].extend(record.get("severity_scores", []))
-        group["_fixed_events"].extend(record.get("fixed_events", []))
-        group["_references"].extend(record.get("references", []))
+        group["_severity_scores"].extend(
+            record.get("severity_scores", [])
+        )
+        group["_fixed_events"].extend(
+            record.get("fixed_events", [])
+        )
+        group["_references"].extend(
+            record.get("references", [])
+        )
 
     merged = []
 
     for group in groups:
-        ids = sorted(group["_identifiers"], key=lambda value: (
-            {"GHSA": 0, "CVE": 1, "PYSEC": 2}.get(
-                value.split("-", 1)[0].upper(), 3
+        ids = sorted(
+            group["_identifiers"],
+            key=lambda value: (
+                {
+                    "GHSA": 0,
+                    "CVE": 1,
+                    "PYSEC": 2,
+                }.get(value.split("-", 1)[0].upper(), 3),
+                value,
             ),
-            value,
-        ))
+        )
 
+        primary_id = preferred_id(ids)
         summaries = group["_summaries"]
         summary = max(summaries, key=len) if summaries else ""
 
@@ -179,12 +205,15 @@ def merge_alias_duplicates(records):
             severity = "Not provided"
 
         merged.append({
+            "ecosystem": group["ecosystem"],
             "package": group["package"],
             "version": group["version"],
             "source": group["source"],
-            "id": preferred_id(ids),
+            "id": primary_id,
             "ids": ids,
-            "aliases": [item for item in ids if item != preferred_id(ids)],
+            "aliases": [
+                item for item in ids if item != primary_id
+            ],
             "summary": summary,
             "severity": severity,
             "severity_scores": scores,
@@ -227,17 +256,28 @@ def lookup_osv(packages):
             with urlopen(request, timeout=20) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except (URLError, TimeoutError, json.JSONDecodeError) as error:
-            warnings.append(f"OSV package lookup nahi ho saka: {error}")
+            warnings.append(
+                f"OSV package lookup nahi ho saka: {error}"
+            )
             continue
 
-        for package, result in zip(batch, data.get("results", [])):
+        results = data.get("results", [])
+
+        # OSV batch response ka order request ke order se match hota hai.
+        for package, result in zip(batch, results):
             for vulnerability in result.get("vulns", []):
                 advisory_id = vulnerability.get("id", "Unknown ID")
 
                 if advisory_id not in detail_cache:
                     try:
-                        detail_cache[advisory_id] = get_advisory_details(advisory_id)
-                    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+                        detail_cache[advisory_id] = get_advisory_details(
+                            advisory_id
+                        )
+                    except (
+                        URLError,
+                        TimeoutError,
+                        json.JSONDecodeError,
+                    ) as error:
                         warnings.append(
                             f"{advisory_id} ki details nahi mil saki: {error}"
                         )
@@ -247,6 +287,7 @@ def lookup_osv(packages):
                 severity, severity_scores = extract_severity(details)
 
                 records.append({
+                    "ecosystem": package["ecosystem"],
                     "package": package["name"],
                     "version": package["version"],
                     "source": package["source"],
