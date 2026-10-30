@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   audit:
-    name: Scan and validate dependency patch
+    name: Scan and optionally validate dependency patch
     runs-on: ubuntu-latest
 
     steps:
@@ -42,10 +42,23 @@ jobs:
       - name: Generate dependency update patch
         run: python patch_suggestions.py demo_project
 
+      - name: Check whether a patch was generated
+        id: patch_file
+        run: |
+          if [ -f dependency_update_suggestions.patch ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Patch file mila; validation chalegi."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Patch file nahi bani; validation skip hogi."
+          fi
+
       - name: Validate dependency update patch
+        if: ${{ steps.patch_file.outputs.exists == 'true' }}
         run: python patch_validator.py demo_project dependency_update_suggestions.patch
 
       - name: Check patch validation result
+        if: ${{ steps.patch_file.outputs.exists == 'true' }}
         run: |
           python - <<'PY'
           import json
@@ -63,10 +76,10 @@ jobs:
           }
 
           if status not in accepted_statuses:
-              print("Patch validation incomplete, or advisories still remain.")
+              print("Validation incomplete, ya updated package par advisory baaki hai.")
               sys.exit(1)
 
-          print("Patch applied in a temporary copy; no matching advisories remain.")
+          print("Patch validation successful.")
           PY
 
       - name: Save reports and patch as downloadable artifact
