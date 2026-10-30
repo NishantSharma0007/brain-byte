@@ -42,14 +42,37 @@ SAFE_CASES = [
     },
 ]
 
+DEPENDENCY_VULNERABLE_CASES = [
+    {
+        "name": "Vulnerable PyPI dependency",
+        "path": "benchmarks/dep_py_vulnerable",
+        "package": "requests",
+        "version": "2.31.0",
+        "expected_advisory_id": "GHSA-9hjg-9r4m-mvj7",
+    },
+]
+
+DEPENDENCY_SAFE_CASES = [
+    {
+        "name": "Updated PyPI dependency",
+        "path": "benchmarks/dep_py_safe",
+        "package": "requests",
+        "version": "2.33.0",
+    },
+]
+
 RULE_PATTERN = re.compile(
     r"^\[((?:PY|JS)-[A-Z0-9_-]+)\]",
+    re.MULTILINE,
+)
+OSV_PACKAGE_PATTERN = re.compile(
+    r"^\[OSV\][^\r\n]*?\s+([A-Za-z0-9_.-]+)==([^\s]+)",
     re.MULTILINE,
 )
 
 
 def scan_example(example_path):
-    """Scanner chala kar code rule IDs aur console evidence return karta hai."""
+    """Scanner chala kar code rules aur console output return karta hai."""
     project_path = PROJECT_ROOT / example_path
 
     if not project_path.is_dir():
@@ -90,6 +113,14 @@ def scan_example(example_path):
             )
 
         return set(RULE_PATTERN.findall(result.stdout)), result.stdout
+
+
+def parse_osv_package_versions(scan_output):
+    """Console report se OSV-hit package/version pairs nikalta hai."""
+    return {
+        (package.lower(), version)
+        for package, version in OSV_PACKAGE_PATTERN.findall(scan_output)
+    }
 
 
 def percentage(numerator, denominator):
@@ -198,6 +229,101 @@ def main():
     print(
         "\nNote: yeh chhote demo examples ka result hai; "
         "ise general-purpose scanner accuracy na samjhein."
+    )
+
+    dependency_tp = 0
+    dependency_fn = 0
+    dependency_fp = 0
+    dependency_tn = 0
+
+    print("\nDependency advisory benchmark shuru...")
+
+    for example in DEPENDENCY_VULNERABLE_CASES:
+        _, scan_output = scan_example(example["path"])
+        package_version = (
+            example["package"].lower(),
+            example["version"],
+        )
+        observed_versions = parse_osv_package_versions(scan_output)
+        expected_id_found = (
+            example["expected_advisory_id"] in scan_output
+        )
+
+        if package_version in observed_versions and expected_id_found:
+            dependency_tp += 1
+            result_label = "TP - expected OSV advisory detect hui"
+        else:
+            dependency_fn += 1
+            result_label = "FN - expected OSV advisory detect nahi hui"
+
+        print(f'\n{example["name"]}: {result_label}')
+        print(
+            f'  Expected: {example["package"]}=={example["version"]} '
+            f'and {example["expected_advisory_id"]}'
+        )
+        print(
+            "  OSV package/version match: "
+            f"{package_version in observed_versions}"
+        )
+
+    for example in DEPENDENCY_SAFE_CASES:
+        _, scan_output = scan_example(example["path"])
+        package_version = (
+            example["package"].lower(),
+            example["version"],
+        )
+        observed_versions = parse_osv_package_versions(scan_output)
+
+        if package_version in observed_versions:
+            dependency_fp += 1
+            result_label = "FP - updated package par advisory aayi"
+        else:
+            dependency_tn += 1
+            result_label = "TN - updated package par advisory nahi aayi"
+
+        print(f'\n{example["name"]}: {result_label}')
+        print(
+            f'  Checked: {example["package"]}=={example["version"]}'
+        )
+
+    dependency_total = (
+        dependency_tp
+        + dependency_fn
+        + dependency_fp
+        + dependency_tn
+    )
+    dependency_accuracy = percentage(
+        dependency_tp + dependency_tn,
+        dependency_total,
+    )
+    dependency_precision = percentage(
+        dependency_tp,
+        dependency_tp + dependency_fp,
+    )
+    dependency_recall = percentage(
+        dependency_tp,
+        dependency_tp + dependency_fn,
+    )
+    dependency_false_positive_rate = percentage(
+        dependency_fp,
+        dependency_fp + dependency_tn,
+    )
+
+    print("\nDependency benchmark summary:")
+    print(f"  TP (vulnerable package detected): {dependency_tp}")
+    print(f"  TN (updated package passed):      {dependency_tn}")
+    print(f"  FP (updated package flagged):     {dependency_fp}")
+    print(f"  FN (vulnerable package missed):   {dependency_fn}")
+    print(f"  Accuracy:                         {dependency_accuracy:.1f}%")
+    print(f"  Precision:                        {dependency_precision:.1f}%")
+    print(f"  Recall:                           {dependency_recall:.1f}%")
+    print(
+        "  False-positive rate:              "
+        f"{dependency_false_positive_rate:.1f}%"
+    )
+    print(f"  Total dependency examples:        {dependency_total}")
+    print(
+        "  Note: dependency results rely on live OSV data and network access."
     )
 
 
