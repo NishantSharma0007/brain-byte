@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   audit:
-    name: Scan and upload reports
+    name: Scan and validate dependency patch
     runs-on: ubuntu-latest
 
     steps:
@@ -39,7 +39,37 @@ jobs:
           sarif_file: audit_report.sarif
           category: codebase-security-auditor
 
-      - name: Save reports as downloadable artifact
+      - name: Generate dependency update patch
+        run: python patch_suggestions.py demo_project
+
+      - name: Validate dependency update patch
+        run: python patch_validator.py demo_project dependency_update_suggestions.patch
+
+      - name: Check patch validation result
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+
+          with open("patch_validation_report.json", encoding="utf-8") as report_file:
+              report = json.load(report_file)
+
+          status = report.get("status")
+          print(f"Patch validation status: {status}")
+
+          accepted_statuses = {
+              "no_matching_advisories_found_after_patch",
+              "patch_applied_no_matching_advisories_found",
+          }
+
+          if status not in accepted_statuses:
+              print("Patch validation incomplete, or advisories still remain.")
+              sys.exit(1)
+
+          print("Patch applied in a temporary copy; no matching advisories remain.")
+          PY
+
+      - name: Save reports and patch as downloadable artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -48,4 +78,6 @@ jobs:
             audit_report.json
             audit_report.md
             audit_report.sarif
+            dependency_update_suggestions.patch
+            patch_validation_report.json
           if-no-files-found: warn
