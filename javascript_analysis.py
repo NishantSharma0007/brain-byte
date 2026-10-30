@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 
-import tree_sitter_javascript as tree_sitter_javascript
+import tree_sitter_javascript
 from tree_sitter import Language, Parser
 
 from models import Finding
@@ -13,9 +13,38 @@ JAVASCRIPT_PARSER = Parser(JAVASCRIPT_LANGUAGE)
 EXEC_FUNCTIONS = {"exec", "execSync"}
 EVAL_FUNCTIONS = {"eval"}
 
+FUNCTION_NODE_TYPES = {
+    "function_declaration",
+    "function_expression",
+    "arrow_function",
+    "method_definition",
+}
+
+SOURCE_PATTERNS = (
+    (
+        re.compile(
+            r"\b(?:req|request)\s*\.\s*"
+            r"(?:query|body|params|cookies)\b"
+        ),
+        "Web request data source",
+    ),
+    (
+        re.compile(r"\bprocess\s*\.\s*argv\b"),
+        "Command-line argument source",
+    ),
+    (
+        re.compile(r"\b(?:window\s*\.\s*)?location\s*\.\s*(?:search|hash)\b"),
+        "Browser URL input source",
+    ),
+    (
+        re.compile(r"\bevent\s*\.\s*data\b"),
+        "Event data source",
+    ),
+)
+
 
 def walk_nodes(root_node):
-    """Syntax tree ke saare named nodes par chalta hai."""
+    """Syntax tree ke named nodes par chalta hai."""
     stack = [root_node]
 
     while stack:
@@ -25,22 +54,144 @@ def walk_nodes(root_node):
 
 
 def node_text(node, source_bytes):
-    """Syntax node ka source text deta hai."""
+    """Tree-sitter node ka source text deta hai."""
     return source_bytes[node.start_byte:node.end_byte].decode(
         "utf-8",
         errors="replace",
     )
 
 
+def unique_strings(values):
+    """Evidence ko duplicate entries ke bina return karta hai."""
+    return list(dict.fromkeys(values))
+
+
+def source_evidence(node, source_bytes):
+    """Node me known user-input source ho to uska evidence deta hai."""
+    text = node_text(node, source_bytes)
+    line_number = node.start_point.row + 1
+    evidence = []
+
+    for pattern, description in SOURCE_PATTERNS:
+        if pattern.search(text):
+            evidence.append(f"{description} at line {line_number}.")
+
+    return unique_strings(evidence)
+
+
+def identifier_names(node, source_bytes):
+    """Expression ke identifier names collect karta hai."""
+    names = set()
+
+    for child in walk_nodes(node):
+        if child.type == "identifier":
+            names.add(node_text(child, source_bytes))
+
+    return names
+
+
+def assignment_parts(node):
+    """Supported assignment node se target aur value nikalta hai."""
+    if node.type == "variable_declarator":
+        target = node.child_by_field_name("name")
+        value = node.child_by_field_name("value")
+    elif node.type == "assignment_expression":
+        target = node.child_by_field_name("left")
+        value = node.child_by_field_name("right")
+    else:
+        return None, None
+
+    if target is None or value is None:
+        return None, None
+
+    if target.type != "identifier":
+        return None, None
+
+    return target, value
+
+
+def nodes_in_scope(scope_root):
+    """
+    Ek scope ke nodes deta hai.
+    Nested function bodies ko us scope se alag rakhta hai.
+    """
+    stack = [scope_root]
+
+    while stack:
+        node = stack.pop()
+
+        if node is not scope_root and node.type in FUNCTION_NODE_TYPES:
+            continue
+
+        yield node
+        stack.extend(reversed(node.named_children))
+
+
+def collect_tainted_variables(scope_nodes, source_bytes):
+    """
+    Scope ke andar source values se assignments tak taint propagate karta hai.
+    """
+    assignments = []
+
+    for node in scope_nodes:
+        target, value = assignment_parts(node)
+
+        if target is not None and value is not None:
+            assignments.append((node, target, value))
+
+    assignments.sort(key=lambda item: item[0].start_byte)
+
+    taint_evidence = {}
+    max_iterations = len(assignments) + 1
+
+    for _ in range(max_iterations):
+        changed = False
+
+        for assignment_node, target_node, value_node in assignments:
+            target_name = node_text(target_node, source_bytes)
+            evidence = []
+
+            evidence.extend(source_evidence(value_node, source_bytes))
+
+            for name in identifier_names(value_node, source_bytes):
+                evidence.extend(taint_evidence.get(name, []))
+
+            if not evidence:
+                continue
+
+            assignment_line = assignment_node.start_point.row + 1
+            evidence.append(
+                f"Assigned to '{target_name}' at line {assignment_line}."
+            )
+            evidence = unique_strings(evidence)
+
+            old_evidence = taint_evidence.get(target_name, [])
+            combined_evidence = unique_strings(old_evidence + evidence)
+
+            if combined_evidence != old_evidence:
+                taint_evidence[target_name] = combined_evidence
+                changed = True
+
+        if not changed:
+            break
+
+    return taint_evidence
+
+
+def expression_taint_evidence(node, source_bytes, taint_evidence):
+    """Expression me direct source ya tainted variable check karta hai."""
+    evidence = []
+    evidence.extend(source_evidence(node, source_bytes))
+
+    for name in identifier_names(node, source_bytes):
+        evidence.extend(taint_evidence.get(name, []))
+
+    return unique_strings(evidence)
+
+
 def collect_child_process_imports(source_text):
     """
-    child_process se import hue exec functions aur namespace aliases dhoondhta hai.
-
-    Examples:
-      const { exec } = require("child_process");
-      const cp = require("node:child_process");
-      import { exec as run } from "child_process";
-      import * as cp from "node:child_process";
+    child_process se imported exec/execSync names aur namespace aliases dhoondhta hai.
     """
     exec_names = set()
     namespace_names = {"child_process"}
@@ -75,6 +226,7 @@ def collect_child_process_imports(source_text):
         for match in pattern.finditer(source_text):
             for item in match.group(1).split(","):
                 parts = re.split(r"\s+as\s+|:", item.strip())
+
                 if not parts:
                     continue
 
@@ -87,7 +239,12 @@ def collect_child_process_imports(source_text):
     return exec_names, namespace_names
 
 
-def is_child_process_exec(function_node, source_bytes, exec_names, namespace_names):
+def is_child_process_exec(
+    function_node,
+    source_bytes,
+    exec_names,
+    namespace_names,
+):
     """Checks whether a call is a known child_process exec/execSync call."""
     function_name = node_text(function_node, source_bytes).strip()
 
@@ -116,11 +273,7 @@ def is_child_process_exec(function_node, source_bytes, exec_names, namespace_nam
 
 
 def is_dynamic_command(argument_node, source_bytes):
-    """
-    String literal command ko skip karta hai.
-    Variable, template interpolation, concatenation, ya call expression
-    ko dynamic samajh kar review ke liye report karta hai.
-    """
+    """Static string commands ko skip karke dynamic expressions identify karta hai."""
     if argument_node.type == "string":
         return False
 
@@ -134,7 +287,7 @@ def is_dynamic_command(argument_node, source_bytes):
 
 
 def analyze_javascript_file(file_path):
-    """JavaScript/JSX file me selected risky patterns dhoondhta hai."""
+    """JavaScript/JSX file me selected risky patterns aur local taint flows dhoondhta hai."""
     source_path = Path(file_path)
     source_bytes = source_path.read_bytes()
     source_text = source_bytes.decode("utf-8", errors="replace")
@@ -147,76 +300,151 @@ def analyze_javascript_file(file_path):
     )
 
     findings = []
+    reported_eval_calls = set()
 
+    # eval() rule har scope me detect hota hai.
     for node in walk_nodes(root_node):
         if node.type != "call_expression":
             continue
 
         function_node = node.child_by_field_name("function")
-        arguments_node = node.child_by_field_name("arguments")
 
-        if function_node is None:
+        if function_node is None or function_node.type != "identifier":
             continue
 
         function_name = node_text(function_node, source_bytes).strip()
+
+        if function_name not in EVAL_FUNCTIONS:
+            continue
+
         line_number = node.start_point.row + 1
+
+        if line_number in reported_eval_calls:
+            continue
+
+        reported_eval_calls.add(line_number)
         call_snippet = node_text(node, source_bytes).strip().replace("\n", " ")
-
-        if (
-            function_node.type == "identifier"
-            and function_name in EVAL_FUNCTIONS
-        ):
-            findings.append(
-                Finding(
-                    rule_id="JS-EVAL-001",
-                    title="Risky JavaScript eval() call",
-                    file=str(source_path),
-                    line=line_number,
-                    message=(
-                        "eval() dynamically evaluates JavaScript. "
-                        "Review whether its input can be influenced by a user."
-                    ),
-                    evidence=[
-                        f"Tree-sitter call expression: {call_snippet[:200]}"
-                    ],
-                )
-            )
-            continue
-
-        if not is_child_process_exec(
-            function_node,
-            source_bytes,
-            imported_exec_names,
-            namespace_names,
-        ):
-            continue
-
-        if arguments_node is None or not arguments_node.named_children:
-            continue
-
-        command_argument = arguments_node.named_children[0]
-
-        if not is_dynamic_command(command_argument, source_bytes):
-            continue
-
-        argument_snippet = node_text(command_argument, source_bytes).strip()
 
         findings.append(
             Finding(
-                rule_id="JS-CMD-001",
-                title="Potential command injection in child_process",
+                rule_id="JS-EVAL-001",
+                title="Risky JavaScript eval() call",
                 file=str(source_path),
                 line=line_number,
                 message=(
-                    "child_process.exec() or execSync() runs a shell command. "
-                    "Its command argument is dynamic; review whether untrusted "
-                    "data can reach it. This rule does not prove taint."
+                    "eval() dynamically evaluates JavaScript. "
+                    "Review whether its input can be influenced by a user."
                 ),
                 evidence=[
-                    f"Command argument: {argument_snippet[:200]}",
-                    f"Tree-sitter call expression: {call_snippet[:200]}",
+                    f"Tree-sitter call expression: {call_snippet[:200]}"
                 ],
             )
         )
+
+    # Module scope aur har function ka local scope alag analyze karo.
+    scope_roots = [root_node]
+
+    for node in walk_nodes(root_node):
+        if node.type not in FUNCTION_NODE_TYPES:
+            continue
+
+        body_node = node.child_by_field_name("body")
+
+        if body_node is not None:
+            scope_roots.append(body_node)
+
+    seen_scope_roots = set()
+
+    for scope_root in scope_roots:
+        scope_key = (
+            scope_root.start_byte,
+            scope_root.end_byte,
+            scope_root.type,
+        )
+
+        if scope_key in seen_scope_roots:
+            continue
+
+        seen_scope_roots.add(scope_key)
+
+        scope_nodes = list(nodes_in_scope(scope_root))
+        taint_evidence = collect_tainted_variables(
+            scope_nodes,
+            source_bytes,
+        )
+
+        for node in scope_nodes:
+            if node.type != "call_expression":
+                continue
+
+            function_node = node.child_by_field_name("function")
+            arguments_node = node.child_by_field_name("arguments")
+
+            if function_node is None or arguments_node is None:
+                continue
+
+            if not is_child_process_exec(
+                function_node,
+                source_bytes,
+                imported_exec_names,
+                namespace_names,
+            ):
+                continue
+
+            arguments = arguments_node.named_children
+
+            if not arguments:
+                continue
+
+            command_argument = arguments[0]
+
+            if not is_dynamic_command(command_argument, source_bytes):
+                continue
+
+            line_number = node.start_point.row + 1
+            call_snippet = node_text(node, source_bytes).strip()
+            call_snippet = call_snippet.replace("\n", " ")[:200]
+
+            flow_evidence = expression_taint_evidence(
+                command_argument,
+                source_bytes,
+                taint_evidence,
+            )
+
+            if flow_evidence:
+                title = (
+                    "Potential command injection: input reaches child_process"
+                )
+                message = (
+                    "A recognized request, browser URL, or command-line input "
+                    "can reach a dynamic child_process shell command in the "
+                    "same function scope. Review and validate this flow."
+                )
+                evidence = flow_evidence + [
+                    f"child_process shell sink at line {line_number}.",
+                    f"Tree-sitter call expression: {call_snippet}",
+                ]
+            else:
+                title = "Potential command injection in child_process"
+                message = (
+                    "child_process.exec() or execSync() runs a shell command. "
+                    "Its command argument is dynamic; review whether untrusted "
+                    "data can reach it. This rule does not prove taint."
+                )
+                evidence = [
+                    f"Dynamic command argument at line {line_number}.",
+                    f"Tree-sitter call expression: {call_snippet}",
+                ]
+
+            findings.append(
+                Finding(
+                    rule_id="JS-CMD-001",
+                    title=title,
+                    file=str(source_path),
+                    line=line_number,
+                    message=message,
+                    evidence=unique_strings(evidence),
+                )
+            )
 
     return findings
