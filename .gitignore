@@ -10,3 +10,5 @@ __pycache__/
 audit_report.json
 audit_report.md
 audit_report.sarif
+dependency_update_suggestions.patch
+patch_validation_report.json
