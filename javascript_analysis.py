@@ -127,7 +127,7 @@ def nodes_in_scope(scope_root):
         stack.extend(reversed(node.named_children))
 
 
-def collect_tainted_variables(scope_nodes, source_bytes):
+def collect_tainted_variables(scope_nodes, source_bytes, initial_taint=None):
     """
     Scope ke andar source values se assignments tak taint propagate karta hai.
     """
@@ -141,7 +141,10 @@ def collect_tainted_variables(scope_nodes, source_bytes):
 
     assignments.sort(key=lambda item: item[0].start_byte)
 
-    taint_evidence = {}
+    taint_evidence = {
+        name: unique_strings(evidence)
+        for name, evidence in (initial_taint or {}).items()
+    }
     max_iterations = len(assignments) + 1
 
     for _ in range(max_iterations):
@@ -188,6 +191,274 @@ def expression_taint_evidence(node, source_bytes, taint_evidence):
 
     return unique_strings(evidence)
 
+
+def parameter_name(parameter_node, source_bytes):
+    """Simple identifier/default/rest function parameters ko read karta hai."""
+    if parameter_node.type == "identifier":
+        return node_text(parameter_node, source_bytes)
+
+    if parameter_node.type == "assignment_pattern":
+        left_node = parameter_node.child_by_field_name("left")
+        if left_node is not None and left_node.type == "identifier":
+            return node_text(left_node, source_bytes)
+
+    if parameter_node.type == "rest_pattern":
+        for child in parameter_node.named_children:
+            if child.type == "identifier":
+                return node_text(child, source_bytes)
+
+    return None
+
+
+def javascript_function_info(function_node, source_bytes):
+    """Function ka naam, parameters aur body nikalta hai."""
+    body_node = function_node.child_by_field_name("body")
+    if body_node is None:
+        return None
+
+    name_node = function_node.child_by_field_name("name")
+
+    if name_node is None:
+        parent_node = function_node.parent
+        if (
+            parent_node is not None
+            and parent_node.type == "variable_declarator"
+        ):
+            name_node = parent_node.child_by_field_name("name")
+
+    function_name = (
+        node_text(name_node, source_bytes)
+        if name_node is not None and name_node.type == "identifier"
+        else None
+    )
+
+    parameters_node = (
+        function_node.child_by_field_name("parameters")
+        or function_node.child_by_field_name("parameter")
+    )
+    parameter_names = []
+
+    if parameters_node is not None:
+        if parameters_node.type == "identifier":
+            parameter_names.append(
+                node_text(parameters_node, source_bytes)
+            )
+        else:
+            for parameter_node in parameters_node.named_children:
+                name = parameter_name(parameter_node, source_bytes)
+                if name:
+                    parameter_names.append(name)
+
+    return {
+        "name": function_name,
+        "parameters": parameter_names,
+        "body": body_node,
+        "node": function_node,
+        "key": f"{function_name or '<anonymous>'}@{function_node.start_byte}",
+        "nodes": list(nodes_in_scope(body_node)),
+    }
+
+
+def collect_javascript_functions(root_node, source_bytes):
+    """File ke supported function declarations aur function expressions collect karta hai."""
+    functions = []
+
+    for node in walk_nodes(root_node):
+        if node.type not in FUNCTION_NODE_TYPES:
+            continue
+
+        info = javascript_function_info(node, source_bytes)
+        if info is not None:
+            functions.append(info)
+
+    return functions
+
+
+def propagate_function_parameter_taint(functions, source_bytes):
+    """
+    Same-file direct calls mein tainted arguments ko callee parameters tak propagate karta hai.
+    """
+    functions_by_name = {}
+
+    for function in functions:
+        if function["name"]:
+            functions_by_name.setdefault(
+                function["name"],
+                [],
+            ).append(function)
+
+    parameter_taint = {
+        function["key"]: {
+            parameter: []
+            for parameter in function["parameters"]
+        }
+        for function in functions
+    }
+
+    max_iterations = sum(
+        len(function["parameters"])
+        for function in functions
+    ) + 1
+
+    for _ in range(max_iterations):
+        changed = False
+
+        for caller in functions:
+            caller_taint = collect_tainted_variables(
+                caller["nodes"],
+                source_bytes,
+                parameter_taint[caller["key"]],
+            )
+
+            for call_node in caller["nodes"]:
+                if call_node.type != "call_expression":
+                    continue
+
+                called_function_node = call_node.child_by_field_name(
+                    "function"
+                )
+                arguments_node = call_node.child_by_field_name(
+                    "arguments"
+                )
+
+                if (
+                    called_function_node is None
+                    or called_function_node.type != "identifier"
+                    or arguments_node is None
+                ):
+                    continue
+
+                target_name = node_text(
+                    called_function_node,
+                    source_bytes,
+                )
+                callees = functions_by_name.get(target_name, [])
+
+                if not callees:
+                    continue
+
+                arguments = arguments_node.named_children
+                call_line = call_node.start_point.row + 1
+
+                for callee in callees:
+                    for index, argument in enumerate(arguments):
+                        if index >= len(callee["parameters"]):
+                            continue
+
+                        parameter = callee["parameters"][index]
+                        evidence = expression_taint_evidence(
+                            argument,
+                            source_bytes,
+                            caller_taint,
+                        )
+
+                        if not evidence:
+                            continue
+
+                        evidence.extend([
+                            (
+                                f"Tainted value passed to parameter "
+                                f"'{parameter}' of {target_name}() "
+                                f"at line {call_line}."
+                            ),
+                            (
+                                f"Function parameter '{parameter}' is "
+                                f"tainted inside {target_name}()."
+                            ),
+                        ])
+                        evidence = unique_strings(evidence)
+
+                        old_evidence = parameter_taint[
+                            callee["key"]
+                        ].get(parameter, [])
+                        combined = unique_strings(
+                            old_evidence + evidence
+                        )
+
+                        if combined != old_evidence:
+                            parameter_taint[callee["key"]][
+                                parameter
+                            ] = combined
+                            changed = True
+
+        if not changed:
+            break
+
+    return parameter_taint
+
+
+def collect_function_initial_taint(
+    function,
+    functions_by_start,
+    parameter_taint,
+    source_bytes,
+    cache,
+):
+    """Function parameters aur enclosing lexical scope se taint leta hai."""
+    function_key = function["key"]
+    if function_key in cache:
+        return cache[function_key]
+
+    initial_taint = {
+        name: list(evidence)
+        for name, evidence in parameter_taint[function_key].items()
+        if evidence
+    }
+
+    parent_node = function["node"].parent
+    enclosing_function = None
+
+    while parent_node is not None:
+        if parent_node.type in FUNCTION_NODE_TYPES:
+            enclosing_function = functions_by_start.get(
+                parent_node.start_byte
+            )
+            if enclosing_function is not None:
+                break
+        parent_node = parent_node.parent
+
+    if enclosing_function is not None:
+        parent_initial_taint = collect_function_initial_taint(
+            enclosing_function,
+            functions_by_start,
+            parameter_taint,
+            source_bytes,
+            cache,
+        )
+        parent_taint = collect_tainted_variables(
+            enclosing_function["nodes"],
+            source_bytes,
+            parent_initial_taint,
+        )
+
+        local_bindings = set(function["parameters"])
+        for node in function["nodes"]:
+            if node.type == "variable_declarator":
+                name_node = node.child_by_field_name("name")
+                if name_node is not None and name_node.type == "identifier":
+                    local_bindings.add(
+                        node_text(name_node, source_bytes)
+                    )
+            elif node.type in {"function_declaration", "class_declaration"}:
+                name_node = node.child_by_field_name("name")
+                if name_node is not None and name_node.type == "identifier":
+                    local_bindings.add(
+                        node_text(name_node, source_bytes)
+                    )
+
+        for name, evidence in parent_taint.items():
+            # Inner parameters/declarations shadow outer closure variables.
+            if (
+                name in local_bindings
+                and not parameter_taint[function_key].get(name)
+            ):
+                continue
+            initial_taint[name] = unique_strings(
+                initial_taint.get(name, []) + evidence
+            )
+
+    cache[function_key] = initial_taint
+    return initial_taint
 
 def collect_child_process_imports(source_text):
     """
@@ -287,7 +558,7 @@ def is_dynamic_command(argument_node, source_bytes):
 
 
 def analyze_javascript_file(file_path):
-    """JavaScript/JSX file me selected risky patterns aur local taint flows dhoondhta hai."""
+    """JS/JSX me risky patterns aur same-file function/closure taint flows dhoondhta hai."""
     source_path = Path(file_path)
     source_bytes = source_path.read_bytes()
     source_text = source_bytes.decode("utf-8", errors="replace")
@@ -341,21 +612,38 @@ def analyze_javascript_file(file_path):
             )
         )
 
-    # Module scope aur har function ka local scope alag analyze karo.
-    scope_roots = [root_node]
+    # Function parameters par same-file call flows propagate karo.
+    function_infos = collect_javascript_functions(
+        root_node,
+        source_bytes,
+    )
+    function_parameter_taint = propagate_function_parameter_taint(
+        function_infos,
+        source_bytes,
+    )
+    functions_by_start = {
+        function["node"].start_byte: function
+        for function in function_infos
+    }
+    initial_taint_cache = {}
 
-    for node in walk_nodes(root_node):
-        if node.type not in FUNCTION_NODE_TYPES:
-            continue
-
-        body_node = node.child_by_field_name("body")
-
-        if body_node is not None:
-            scope_roots.append(body_node)
-
+    scope_entries = [(root_node, {})]
+    scope_entries.extend(
+        (
+            function["body"],
+            collect_function_initial_taint(
+                function,
+                functions_by_start,
+                function_parameter_taint,
+                source_bytes,
+                initial_taint_cache,
+            ),
+        )
+        for function in function_infos
+    )
     seen_scope_roots = set()
 
-    for scope_root in scope_roots:
+    for scope_root, initial_taint in scope_entries:
         scope_key = (
             scope_root.start_byte,
             scope_root.end_byte,
@@ -371,8 +659,8 @@ def analyze_javascript_file(file_path):
         taint_evidence = collect_tainted_variables(
             scope_nodes,
             source_bytes,
+            initial_taint,
         )
-
         for node in scope_nodes:
             if node.type != "call_expression":
                 continue
@@ -417,8 +705,9 @@ def analyze_javascript_file(file_path):
                 )
                 message = (
                     "A recognized request, browser URL, or command-line input "
-                    "can reach a dynamic child_process shell command in the "
-                    "same function scope. Review and validate this flow."
+                    "can reach a dynamic child_process shell command through "
+                    "same-file direct calls or a nested closure. Review and "
+                    "validate this flow."
                 )
                 evidence = flow_evidence + [
                     f"child_process shell sink at line {line_number}.",
