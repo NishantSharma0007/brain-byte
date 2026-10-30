@@ -323,7 +323,7 @@ def analyze_javascript_file(file_path):
             continue
 
         reported_eval_calls.add(line_number)
-        call_snippet = node_text(node, source_bytes).strip().replace("\n", " ")
+        call_snippet = re.sub(r"\s+", " ", node_text(node, source_bytes)).strip()
 
         findings.append(
             Finding(
@@ -403,7 +403,7 @@ def analyze_javascript_file(file_path):
 
             line_number = node.start_point.row + 1
             call_snippet = node_text(node, source_bytes).strip()
-            call_snippet = call_snippet.replace("\n", " ")[:200]
+            call_snippet = re.sub(r"\s+", " ", call_snippet).strip()[:200]
 
             flow_evidence = expression_taint_evidence(
                 command_argument,
