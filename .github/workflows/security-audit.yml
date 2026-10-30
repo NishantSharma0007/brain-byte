@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   audit:
-    name: Scan and upload SARIF
+    name: Scan and upload reports
     runs-on: ubuntu-latest
 
     steps:
@@ -38,3 +38,14 @@ jobs:
         with:
           sarif_file: audit_report.sarif
           category: codebase-security-auditor
+
+      - name: Save reports as downloadable artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-audit-reports
+          path: |
+            audit_report.json
+            audit_report.md
+            audit_report.sarif
+          if-no-files-found: warn
