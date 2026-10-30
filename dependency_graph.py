@@ -1,203 +1,272 @@
 from pathlib import Path
 
 
+def package_key(package):
+    return (
+        package.get("ecosystem", "PyPI"),
+        package["name"],
+        str(package["version"]),
+    )
+
+
+def package_node_id(ecosystem, name, version):
+    return f"package:{ecosystem}:{name}@{version}"
+
+
+def manifest_node_id(source):
+    return f"manifest:{source}"
+
+
+def normalize_source(source, project_root):
+    source = str(source).strip()
+
+    if not source:
+        return ""
+
+    source_path = Path(source)
+
+    if source_path.is_absolute():
+        try:
+            return source_path.resolve().relative_to(project_root).as_posix()
+        except ValueError:
+            return source_path.as_posix()
+
+    return source_path.as_posix()
+
+
+def split_sources(source, project_root):
+    if not source:
+        return []
+
+    return sorted({
+        normalized
+        for item in str(source).split(",")
+        if (normalized := normalize_source(item, project_root))
+    })
+
+
+def add_node(nodes_by_id, node):
+    nodes_by_id.setdefault(node["id"], node)
+
+
+def add_edge(edges, seen_edges, edge):
+    edge_key = (
+        edge["from"],
+        edge["to"],
+        edge["type"],
+        edge.get("dependency_version"),
+        edge.get("marker"),
+    )
+
+    if edge_key not in seen_edges:
+        edges.append(edge)
+        seen_edges.add(edge_key)
+
+
 def build_dependency_graph(project_folder, packages, advisories):
-    project_folder = Path(project_folder).resolve()
-    repository_id = f"REPO:{project_folder.name}"
-
-    nodes = [{
-        "id": repository_id,
-        "type": "REPOSITORY",
-        "name": project_folder.name,
-    }]
-
+    """
+    Package manifests, installed packages, dependency links, aur OSV findings
+    ka ecosystem-aware graph banata hai.
+    """
+    project_root = Path(project_folder).resolve()
+    nodes_by_id = {}
     edges = []
-    package_nodes = {}
-    packages_by_name = {}
+    seen_edges = set()
 
-    # Advisory IDs ko package/version ke saath map karo.
     advisories_by_package = {}
 
     for advisory in advisories:
+        ecosystem = advisory.get("ecosystem", "PyPI")
         key = (
-            "PyPI",
-            advisory["package"],
-            advisory["version"],
+            ecosystem,
+            advisory.get("package"),
+            str(advisory.get("version")),
         )
 
-        ids = advisory.get(
-            "ids",
-            [advisory.get("id", "Unknown ID")],
-        )
+        advisories_by_package.setdefault(key, []).append(advisory)
 
-        advisories_by_package.setdefault(key, set()).update(ids)
+    packages_by_key = {}
+    packages_by_ecosystem_name = {}
 
-    # Package nodes banao.
+    # Package nodes aur manifest nodes.
     for package in packages:
-        package_id = (
-            f"{package['ecosystem']}:"
-            f"{package['name']}@{package['version']}"
+        ecosystem, name, version = package_key(package)
+        package_id = package_node_id(ecosystem, name, version)
+
+        matching_advisories = advisories_by_package.get(
+            (ecosystem, name, version),
+            [],
         )
 
-        package_nodes[package_id] = package
-        packages_by_name.setdefault(
-            (package["ecosystem"], package["name"]),
+        advisory_ids = sorted({
+            advisory_id
+            for advisory in matching_advisories
+            for advisory_id in (
+                advisory.get("ids")
+                or [advisory.get("id", "Unknown ID")]
+            )
+        })
+
+        sources = split_sources(
+            package.get("source", ""),
+            project_root,
+        )
+
+        package_node = {
+            "id": package_id,
+            "type": "PACKAGE",
+            "ecosystem": ecosystem,
+            "name": name,
+            "version": version,
+            "direct": bool(package.get("direct", False)),
+            "sources": sources,
+            "vulnerable": bool(matching_advisories),
+            "advisory_ids": advisory_ids,
+        }
+
+        add_node(nodes_by_id, package_node)
+        packages_by_key[(ecosystem, name, version)] = package
+
+        packages_by_ecosystem_name.setdefault(
+            (ecosystem, name),
             [],
         ).append(package_id)
 
-        sources = package.get("source", "").split(", ")
+        for source in sources:
+            file_id = manifest_node_id(source)
 
-        nodes.append({
-            "id": package_id,
-            "type": "PACKAGE",
-            "ecosystem": package["ecosystem"],
-            "name": package["name"],
-            "version": package["version"],
-            "direct": package.get("direct", False),
-            "sources": sources,
-            "advisory_ids": sorted(
-                advisories_by_package.get(
-                    (
-                        package["ecosystem"],
-                        package["name"],
-                        package["version"],
-                    ),
-                    set(),
-                )
-            ),
-        })
-
-    # Repository -> direct package edges.
-    direct_packages = [
-        package for package in packages
-        if package.get("direct", False)
-    ]
-
-    for package in direct_packages:
-        package_id = (
-            f"{package['ecosystem']}:"
-            f"{package['name']}@{package['version']}"
-        )
-
-        edges.append({
-            "from": repository_id,
-            "to": package_id,
-            "type": "DECLARES",
-        })
-
-    # If a lockfile is present without project metadata, infer roots
-    # from packages that no other locked package references.
-    if packages and not direct_packages:
-        referenced_names = set()
-
-        for package in packages:
-            for dependency in package.get("dependencies", []):
-                referenced_names.add(dependency["name"])
-
-        inferred_roots = [
-            package for package in packages
-            if package["name"] not in referenced_names
-        ]
-
-        for package in inferred_roots:
-            package_id = (
-                f"{package['ecosystem']}:"
-                f"{package['name']}@{package['version']}"
+            add_node(
+                nodes_by_id,
+                {
+                    "id": file_id,
+                    "type": "MANIFEST",
+                    "file": source,
+                },
             )
 
-            edges.append({
-                "from": repository_id,
-                "to": package_id,
-                "type": "ROOT_INFERRED",
-            })
+            add_edge(
+                edges,
+                seen_edges,
+                {
+                    "from": file_id,
+                    "to": package_id,
+                    "type": "DECLARES",
+                },
+            )
 
-    # Package -> transitive dependency edges.
-    unresolved_nodes = {}
-
+    # Package-to-package dependency edges.
     for package in packages:
-        source_id = (
-            f"{package['ecosystem']}:"
-            f"{package['name']}@{package['version']}"
+        ecosystem, name, version = package_key(package)
+        parent_id = package_node_id(ecosystem, name, version)
+        parent_sources = set(
+            split_sources(package.get("source", ""), project_root)
         )
 
         for dependency in package.get("dependencies", []):
-            dependency_name = dependency["name"]
-            dependency_key = (
-                package["ecosystem"],
-                dependency_name,
+            dependency_name = dependency.get("name")
+
+            if not dependency_name:
+                continue
+
+            dependency_ecosystem = dependency.get(
+                "ecosystem",
+                ecosystem,
             )
-            candidates = packages_by_name.get(dependency_key, [])
+            requested_version = dependency.get("version")
             marker = dependency.get("marker")
 
-            if len(candidates) == 1:
-                edge = {
-                    "from": source_id,
-                    "to": candidates[0],
-                    "type": "DEPENDS_ON",
-                }
-                if marker:
-                    edge["marker"] = marker
-                edges.append(edge)
+            candidates = packages_by_ecosystem_name.get(
+                (dependency_ecosystem, dependency_name),
+                [],
+            )
 
-            elif len(candidates) > 1:
-                # Multiple locked versions may apply under different markers.
-                for target_id in candidates:
-                    edge = {
-                        "from": source_id,
-                        "to": target_id,
-                        "type": "DEPENDS_ON_POSSIBLE",
-                        "resolution": "Multiple locked versions; conditions not evaluated",
-                    }
-                    if marker:
-                        edge["marker"] = marker
-                    edges.append(edge)
+            # Agar dependency parser exact version deta hai to usse prefer karo.
+            if requested_version:
+                exact_candidates = [
+                    candidate_id
+                    for candidate_id in candidates
+                    if candidate_id.endswith(f"@{requested_version}")
+                ]
+                if exact_candidates:
+                    candidates = exact_candidates
 
-            else:
-                unresolved_id = (
-                    f"{package['ecosystem']}:"
-                    f"{dependency_name}@unresolved"
+            # Same lockfile se aane wale resolved packages ko preference do.
+            same_source_candidates = []
+
+            for candidate_id in candidates:
+                candidate_node = nodes_by_id[candidate_id]
+                candidate_sources = set(candidate_node.get("sources", []))
+
+                if parent_sources.intersection(candidate_sources):
+                    same_source_candidates.append(candidate_id)
+
+            if same_source_candidates:
+                candidates = same_source_candidates
+
+            if not candidates:
+                reference_version = requested_version or "*"
+                reference_id = (
+                    f"dependency-ref:{dependency_ecosystem}:"
+                    f"{dependency_name}@{reference_version}"
                 )
 
-                if unresolved_id not in unresolved_nodes:
-                    unresolved_nodes[unresolved_id] = {
-                        "id": unresolved_id,
-                        "type": "UNRESOLVED_PACKAGE",
-                        "ecosystem": package["ecosystem"],
+                add_node(
+                    nodes_by_id,
+                    {
+                        "id": reference_id,
+                        "type": "DEPENDENCY_REFERENCE",
+                        "ecosystem": dependency_ecosystem,
                         "name": dependency_name,
-                    }
+                        "requested_version": requested_version,
+                        "resolved": False,
+                    },
+                )
 
-                edge = {
-                    "from": source_id,
-                    "to": unresolved_id,
-                    "type": "DEPENDS_ON_UNRESOLVED",
-                }
-                if marker:
-                    edge["marker"] = marker
-                edges.append(edge)
+                add_edge(
+                    edges,
+                    seen_edges,
+                    {
+                        "from": parent_id,
+                        "to": reference_id,
+                        "type": "DEPENDS_ON",
+                        "resolved": False,
+                        "dependency_version": requested_version,
+                        "marker": marker,
+                    },
+                )
+                continue
 
-    nodes.extend(unresolved_nodes.values())
+            multiple_candidates = len(candidates) > 1
 
-    # Remove duplicate edges.
-    unique_edges = []
-    seen_edges = set()
-
-    for edge in edges:
-        edge_key = (
-            edge["from"],
-            edge["to"],
-            edge["type"],
-            edge.get("marker"),
-        )
-
-        if edge_key not in seen_edges:
-            seen_edges.add(edge_key)
-            unique_edges.append(edge)
+            for candidate_id in sorted(candidates):
+                add_edge(
+                    edges,
+                    seen_edges,
+                    {
+                        "from": parent_id,
+                        "to": candidate_id,
+                        "type": "DEPENDS_ON",
+                        "resolved": not multiple_candidates,
+                        "resolution": (
+                            "multiple_versions"
+                            if multiple_candidates
+                            else "matched"
+                        ),
+                        "dependency_version": requested_version,
+                        "marker": marker,
+                    },
+                )
 
     return {
         "scope": (
-            "Direct and lockfile dependency relationships. "
-            "Environment markers are recorded but not evaluated."
+            "Manifest-to-package and package-to-dependency graph. "
+            "Package IDs include ecosystem. If a dependency name matches "
+            "multiple installed versions and no exact version is available, "
+            "all matching versions are shown as ambiguous candidates."
         ),
-        "nodes": nodes,
-        "edges": unique_edges,
+        "nodes": sorted(
+            nodes_by_id.values(),
+            key=lambda node: node["id"],
+        ),
+        "edges": edges,
     }
