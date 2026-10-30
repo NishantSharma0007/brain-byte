@@ -4,7 +4,7 @@ from pathlib import Path
 
 from inventory import find_python_files, find_javascript_files
 from code_analysis import analyze_file
-from javascript_analysis import analyze_javascript_file
+from javascript_analysis import analyze_javascript_files
 from dependencies import parse_requirements
 from osv_lookup import lookup_osv
 from dependency_graph import build_dependency_graph
@@ -33,9 +33,8 @@ def scan_project(project_folder, enable_ai=False, model=None):
     for file_path in python_files:
         code_findings.extend(analyze_file(file_path))
 
-    # Tree-sitter JavaScript analyzer.
-    for file_path in javascript_files:
-        code_findings.extend(analyze_javascript_file(file_path))
+    # Tree-sitter JavaScript analyzer with supported relative-module flows.
+    code_findings.extend(analyze_javascript_files(javascript_files))
 
     # Requirements aur lockfiles se packages padho.
     packages = parse_requirements(project_folder)

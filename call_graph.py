@@ -5,6 +5,10 @@ import tree_sitter_javascript
 from tree_sitter import Language, Parser
 
 from inventory import find_javascript_files
+from javascript_analysis import (
+    parse_named_module_exports,
+    parse_named_module_imports,
+)
 
 
 JAVASCRIPT_LANGUAGE = Language(tree_sitter_javascript.language())
@@ -325,6 +329,8 @@ def add_javascript_graph(
     seen_nodes,
     seen_edges,
 ):
+    file_records = {}
+
     for file_path in javascript_files:
         file_path = Path(file_path)
 
@@ -349,6 +355,20 @@ def add_javascript_graph(
             tree.root_node,
             source_bytes,
         )
+        file_records[str(resolved_path)] = {
+            "relative_path": relative_path,
+            "source_bytes": source_bytes,
+            "tree": tree,
+            "functions": functions,
+            "imports": parse_named_module_imports(
+                source_bytes.decode("utf-8", errors="replace"),
+                resolved_path,
+                javascript_files,
+            ),
+            "exports": parse_named_module_exports(
+                source_bytes.decode("utf-8", errors="replace")
+            ),
+        }
 
         for function_name, function_info in functions.items():
             add_function_node(
@@ -396,6 +416,53 @@ def add_javascript_graph(
                     seen_edges,
                 )
 
+    # Imported relative named calls ko second pass mein connect karo, ab jab
+    # project ke saare function aur export nodes ban chuke hain.
+    for caller_file_key, caller_record in file_records.items():
+        for function_name, function_info in caller_record["functions"].items():
+            caller_id = (
+                f"{caller_record['relative_path']}::{function_name}"
+            )
+
+            for call in javascript_calls_in_function(function_info["body"]):
+                called_function = call.child_by_field_name("function")
+                if called_function is None or called_function.type != "identifier":
+                    continue
+
+                local_name = node_text(
+                    called_function,
+                    caller_record["source_bytes"],
+                )
+                binding = caller_record["imports"].get(local_name)
+                if binding is None:
+                    continue
+
+                target_file_key, exported_name = binding
+                target_record = file_records.get(target_file_key)
+                if target_record is None:
+                    continue
+
+                target_function_name = target_record["exports"].get(
+                    exported_name
+                )
+                if (
+                    target_function_name is None
+                    or target_function_name not in target_record["functions"]
+                ):
+                    continue
+
+                target_id = (
+                    f"{target_record['relative_path']}::"
+                    f"{target_function_name}"
+                )
+                add_call_edge(
+                    caller_id,
+                    target_id,
+                    call.start_point.row + 1,
+                    edges,
+                    seen_edges,
+                )
+
 
 def build_call_graph(
     project_folder,
@@ -432,9 +499,9 @@ def build_call_graph(
 
     return {
         "scope": (
-            "Same-file calls between top-level Python and JavaScript "
-            "functions. Imported, dynamic, nested, and class-method "
-            "calls are not included."
+            "Same-file top-level Python and JavaScript calls, plus resolved "
+            "named relative JavaScript imports. Python imported, dynamic, "
+            "nested, and class-method calls are not included."
         ),
         "nodes": nodes,
         "edges": edges,

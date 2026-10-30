@@ -274,16 +274,23 @@ def collect_javascript_functions(root_node, source_bytes):
     return functions
 
 
-def propagate_function_parameter_taint(functions, source_bytes):
+def propagate_function_parameter_taint(
+    functions,
+    source_bytes=None,
+    module_imports=None,
+    module_exports=None,
+    initial_parameter_taint=None,
+):
     """
-    Same-file direct calls mein tainted arguments ko callee parameters tak propagate karta hai.
+    Same-file calls aur resolved named module imports mein tainted arguments
+    ko callee parameters tak propagate karta hai.
     """
-    functions_by_name = {}
+    functions_by_file_name = {}
 
     for function in functions:
         if function["name"]:
-            functions_by_name.setdefault(
-                function["name"],
+            functions_by_file_name.setdefault(
+                (function.get("file_key"), function["name"]),
                 [],
             ).append(function)
 
@@ -294,6 +301,15 @@ def propagate_function_parameter_taint(functions, source_bytes):
         }
         for function in functions
     }
+    for function_key, seeded_parameters in (initial_parameter_taint or {}).items():
+        if function_key not in parameter_taint:
+            continue
+        for parameter, evidence in seeded_parameters.items():
+            if parameter not in parameter_taint[function_key]:
+                continue
+            parameter_taint[function_key][parameter] = unique_strings(
+                parameter_taint[function_key][parameter] + evidence
+            )
 
     max_iterations = sum(
         len(function["parameters"])
@@ -304,9 +320,13 @@ def propagate_function_parameter_taint(functions, source_bytes):
         changed = False
 
         for caller in functions:
+            caller_source = caller.get("source_bytes", source_bytes)
+            if caller_source is None:
+                continue
+
             caller_taint = collect_tainted_variables(
                 caller["nodes"],
-                source_bytes,
+                caller_source,
                 parameter_taint[caller["key"]],
             )
 
@@ -330,9 +350,35 @@ def propagate_function_parameter_taint(functions, source_bytes):
 
                 target_name = node_text(
                     called_function_node,
-                    source_bytes,
+                    caller_source,
                 )
-                callees = functions_by_name.get(target_name, [])
+                caller_file_key = caller.get("file_key")
+                callees = functions_by_file_name.get(
+                    (caller_file_key, target_name),
+                    [],
+                )
+
+                # Cross-file propagation only follows an imported, exported
+                # named function. This avoids matching unrelated functions
+                # that happen to share a name.
+                if not callees:
+                    imported_binding = (module_imports or {}).get(
+                        caller_file_key,
+                        {},
+                    ).get(target_name)
+
+                    if imported_binding:
+                        target_file_key, exported_name = imported_binding
+                        local_name = (module_exports or {}).get(
+                            target_file_key,
+                            {},
+                        ).get(exported_name)
+
+                        if local_name:
+                            callees = functions_by_file_name.get(
+                                (target_file_key, local_name),
+                                [],
+                            )
 
                 if not callees:
                     continue
@@ -348,24 +394,46 @@ def propagate_function_parameter_taint(functions, source_bytes):
                         parameter = callee["parameters"][index]
                         evidence = expression_taint_evidence(
                             argument,
-                            source_bytes,
+                            caller_source,
                             caller_taint,
                         )
 
                         if not evidence:
                             continue
 
-                        evidence.extend([
-                            (
-                                f"Tainted value passed to parameter "
-                                f"'{parameter}' of {target_name}() "
-                                f"at line {call_line}."
-                            ),
-                            (
-                                f"Function parameter '{parameter}' is "
-                                f"tainted inside {target_name}()."
-                            ),
-                        ])
+                        caller_file_key = caller.get("file_key")
+                        callee_file_key = callee.get("file_key")
+                        if (
+                            caller_file_key
+                            and callee_file_key
+                            and caller_file_key != callee_file_key
+                        ):
+                            caller_file_name = Path(caller_file_key).name
+                            callee_file_name = Path(callee_file_key).name
+                            evidence.extend([
+                                (
+                                    f"Cross-file call from {caller_file_name} "
+                                    f"line {call_line} passes tainted data to "
+                                    f"parameter '{parameter}' of "
+                                    f"{target_name}() in {callee_file_name}."
+                                ),
+                                (
+                                    f"Function parameter '{parameter}' is "
+                                    f"tainted inside {callee_file_name}."
+                                ),
+                            ])
+                        else:
+                            evidence.extend([
+                                (
+                                    f"Tainted value passed to parameter "
+                                    f"'{parameter}' of {target_name}() "
+                                    f"at line {call_line}."
+                                ),
+                                (
+                                    f"Function parameter '{parameter}' is "
+                                    f"tainted inside {target_name}()."
+                                ),
+                            ])
                         evidence = unique_strings(evidence)
 
                         old_evidence = parameter_taint[
@@ -385,6 +453,231 @@ def propagate_function_parameter_taint(functions, source_bytes):
             break
 
     return parameter_taint
+
+
+def resolve_relative_module(importer_path, module_specifier, available_files):
+    """Project ke supported JS file paths mein relative module resolve karta hai."""
+    if not module_specifier.startswith("."):
+        return None
+
+    base_path = Path(importer_path).parent / module_specifier
+    candidates = [base_path]
+
+    if not base_path.suffix:
+        for extension in (".js", ".jsx", ".mjs", ".cjs"):
+            candidates.append(Path(f"{base_path}{extension}"))
+        for extension in (".js", ".jsx", ".mjs", ".cjs"):
+            candidates.append(base_path / f"index{extension}")
+
+    available_by_key = {
+        str(Path(path).resolve()): Path(path).resolve()
+        for path in available_files
+    }
+
+    for candidate in candidates:
+        key = str(candidate.resolve())
+        if key in available_by_key:
+            return key
+
+    return None
+
+
+def parse_named_module_imports(source_text, source_path, available_files):
+    """CommonJS/ESM named relative imports ko local names se map karta hai."""
+    imports = {}
+    patterns = (
+        re.compile(
+            r"""(?:const|let|var)\s*\{([^}]+)\}\s*=\s*require\s*\(\s*(['\"])(\.{1,2}/[^'\"]+)\2\s*\)"""
+        ),
+        re.compile(
+            r"""import\s*\{([^}]+)\}\s*from\s*(['\"])(\.{1,2}/[^'\"]+)\2"""
+        ),
+    )
+
+    for pattern in patterns:
+        for match in pattern.finditer(source_text):
+            bindings_text = match.group(1)
+            module_specifier = match.group(3)
+            target_file_key = resolve_relative_module(
+                source_path,
+                module_specifier,
+                available_files,
+            )
+            if target_file_key is None:
+                continue
+
+            for item in bindings_text.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+
+                if ":" in item:
+                    imported_name, local_name = item.split(":", 1)
+                elif re.search(r"\s+as\s+", item):
+                    imported_name, local_name = re.split(
+                        r"\s+as\s+",
+                        item,
+                        maxsplit=1,
+                    )
+                else:
+                    imported_name = local_name = item
+
+                imported_name = imported_name.strip()
+                local_name = local_name.strip()
+                if re.fullmatch(r"[A-Za-z_$][\w$]*", imported_name) and re.fullmatch(
+                    r"[A-Za-z_$][\w$]*",
+                    local_name,
+                ):
+                    imports[local_name] = (target_file_key, imported_name)
+
+    return imports
+
+
+def parse_named_module_exports(source_text):
+    """Supported CommonJS/ESM export syntaxes ko function-name map mein badalta hai."""
+    exports = {}
+
+    def add_object_bindings(bindings_text):
+        for item in bindings_text.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                exported_name, local_name = item.split(":", 1)
+            else:
+                exported_name = local_name = item
+            exported_name = exported_name.strip()
+            local_name = local_name.strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", exported_name) and re.fullmatch(
+                r"[A-Za-z_$][\w$]*",
+                local_name,
+            ):
+                exports[exported_name] = local_name
+
+    def add_esm_bindings(bindings_text):
+        for item in bindings_text.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            alias_match = re.fullmatch(
+                r"([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)",
+                item,
+            )
+            if alias_match:
+                local_name, exported_name = alias_match.groups()
+            else:
+                local_name = exported_name = item
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", local_name):
+                exports[exported_name] = local_name
+
+    for match in re.finditer(
+        r"\bmodule\.exports\s*=\s*\{([^}]*)\}",
+        source_text,
+    ):
+        add_object_bindings(match.group(1))
+
+    assignment_patterns = (
+        r"\bexports\.([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)",
+        r"\bmodule\.exports\.([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)",
+    )
+    for pattern in assignment_patterns:
+        for match in re.finditer(pattern, source_text):
+            exports[match.group(1)] = match.group(2)
+
+    declaration_pattern = re.compile(
+        r"\bexport\s+(?:(?:async\s+)?function|(?:const|let|var|class))\s+"
+        r"([A-Za-z_$][\w$]*)"
+    )
+    for match in declaration_pattern.finditer(source_text):
+        exports[match.group(1)] = match.group(1)
+
+    for match in re.finditer(
+        r"\bexport\s*\{([^}]*)\}",
+        source_text,
+    ):
+        add_esm_bindings(match.group(1))
+
+    return exports
+
+
+def collect_project_function_parameter_taint(file_paths):
+    """Project ke relative imports follow karke cross-file taint seeds banata hai."""
+    records = {}
+    all_files = [Path(path).resolve() for path in file_paths]
+
+    for file_path in all_files:
+        try:
+            source_bytes = file_path.read_bytes()
+            source_text = source_bytes.decode("utf-8", errors="replace")
+            tree = JAVASCRIPT_PARSER.parse(source_bytes)
+        except OSError:
+            continue
+
+        file_key = str(file_path)
+        records[file_key] = {
+            "path": file_path,
+            "source_bytes": source_bytes,
+            "source_text": source_text,
+            "root": tree.root_node,
+            "imports": parse_named_module_imports(
+                source_text,
+                file_path,
+                all_files,
+            ),
+            "exports": parse_named_module_exports(source_text),
+            "functions": [],
+        }
+
+    all_functions = []
+    module_imports = {}
+    module_exports = {}
+
+    for file_key, record in records.items():
+        module_imports[file_key] = record["imports"]
+        module_exports[file_key] = record["exports"]
+
+        for function in collect_javascript_functions(
+            record["root"],
+            record["source_bytes"],
+        ):
+            function["local_key"] = function["key"]
+            function["key"] = f"{file_key}::{function['key']}"
+            function["file_key"] = file_key
+            function["source_bytes"] = record["source_bytes"]
+            record["functions"].append(function)
+            all_functions.append(function)
+
+    project_parameter_taint = propagate_function_parameter_taint(
+        all_functions,
+        module_imports=module_imports,
+        module_exports=module_exports,
+    )
+
+    per_file_parameter_taint = {}
+    for file_key, record in records.items():
+        per_file_parameter_taint[file_key] = {
+            function["local_key"]: project_parameter_taint[function["key"]]
+            for function in record["functions"]
+        }
+
+    return per_file_parameter_taint
+
+
+def analyze_javascript_files(file_paths):
+    """Project ke JS files scan karke supported relative imports mein taint trace karta hai."""
+    paths = [Path(path).resolve() for path in file_paths]
+    shared_parameter_taint = collect_project_function_parameter_taint(paths)
+    findings = []
+
+    for file_path in paths:
+        findings.extend(
+            analyze_javascript_file(
+                file_path,
+                shared_parameter_taint.get(str(file_path), {}),
+            )
+        )
+
+    return findings
 
 
 def collect_function_initial_taint(
@@ -557,8 +850,8 @@ def is_dynamic_command(argument_node, source_bytes):
     return True
 
 
-def analyze_javascript_file(file_path):
-    """JS/JSX me risky patterns aur same-file function/closure taint flows dhoondhta hai."""
+def analyze_javascript_file(file_path, shared_parameter_taint=None):
+    """JS/JSX risky patterns aur supported function/module taint flows dhoondhta hai."""
     source_path = Path(file_path)
     source_bytes = source_path.read_bytes()
     source_text = source_bytes.decode("utf-8", errors="replace")
@@ -620,6 +913,7 @@ def analyze_javascript_file(file_path):
     function_parameter_taint = propagate_function_parameter_taint(
         function_infos,
         source_bytes,
+        initial_parameter_taint=shared_parameter_taint,
     )
     functions_by_start = {
         function["node"].start_byte: function
@@ -706,8 +1000,8 @@ def analyze_javascript_file(file_path):
                 message = (
                     "A recognized request, browser URL, or command-line input "
                     "can reach a dynamic child_process shell command through "
-                    "same-file direct calls or a nested closure. Review and "
-                    "validate this flow."
+                    "supported direct calls, nested closures, or a relative "
+                    "named module import. Review and validate this flow."
                 )
                 evidence = flow_evidence + [
                     f"child_process shell sink at line {line_number}.",
