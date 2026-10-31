@@ -326,6 +326,35 @@ def main():
         "  Note: dependency results rely on live OSV data and network access."
     )
 
+    code_benchmark_passed = (
+        false_positives == 0
+        and false_negatives == 0
+    )
+    dependency_benchmark_passed = (
+        dependency_fp == 0
+        and dependency_fn == 0
+    )
+    benchmark_passed = (
+        code_benchmark_passed
+        and dependency_benchmark_passed
+    )
+
+    print("\nCI benchmark gate:")
+    print(
+        "  Code benchmark: "
+        f"{'PASS' if code_benchmark_passed else 'FAIL'}"
+    )
+    print(
+        "  Dependency benchmark: "
+        f"{'PASS' if dependency_benchmark_passed else 'FAIL'}"
+    )
+    print(
+        "  Overall: "
+        f"{'PASS' if benchmark_passed else 'FAIL'}"
+    )
+
+    return 0 if benchmark_passed else 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
