@@ -1,10 +1,11 @@
 # Automated Codebase Security Auditor
 
-A Python command-line prototype that scans local codebases for selected security patterns and known vulnerable dependencies. It traces supported input-to-command flows, builds code and dependency graphs, and creates evidence-linked reports.
+A Python command-line prototype that scans local codebases and public GitHub repositories for selected security patterns and known vulnerable dependencies. It traces supported input-to-command flows, builds code and dependency graphs, and creates evidence-linked reports.
 
 ## Features
 
 - Scans Python and JavaScript files for selected security patterns.
+- Scans a local project folder or a public GitHub repository.
 - Tracks selected tainted input flows through supported function calls.
 - Supports JavaScript same-file flows and named relative CommonJS and ESM imports.
 - Reads pinned Python dependencies from `requirements*.txt` and npm dependencies from `package-lock.json`.
@@ -20,7 +21,7 @@ A Python command-line prototype that scans local codebases for selected security
 
 - Python 3.11 or newer
 - Git
-- Network access for OSV advisory lookups
+- Network access for GitHub clones and OSV advisory lookups
 - Node.js and npm for npm dependency patch suggestions
 - Ollama is optional and needed only for local AI explanations
 
@@ -34,36 +35,53 @@ python -m venv .venv
 python -m pip install -r requirements-auditor.txt
 ```
 
-## Scan a Project
+## Scan a Local Project
 
-Scan the included Python demo project:
+Scan the included Python and JavaScript demo project:
 
 ```powershell
-python scanner.py .\demo_project
+python scan_repository.py .\demo_project
 ```
 
 Scan the included npm dependency demo:
 
 ```powershell
-python scanner.py .\demo_npm
+python scan_repository.py .\demo_npm
 ```
 
-To choose report paths explicitly:
+## Scan a Public GitHub Repository
+
+Give the tool a public GitHub repository URL:
 
 ```powershell
-python scanner.py .\demo_project audit_report.json `
+python scan_repository.py https://github.com/NishantSharma0007/gloooobbox.final
+```
+
+The wrapper clones the repository's default branch into a temporary folder, scans it, and then removes the temporary clone. It does not run the scanned repository's code.
+
+The wrapper accepts these optional report paths:
+
+```powershell
+python scan_repository.py .\demo_project `
+  --json-report audit_report.json `
   --markdown-report audit_report.md `
   --sarif-report audit_report.sarif
 ```
 
-The scanner prints findings and saves JSON, Markdown, and SARIF reports. OSV lookups need network access when pinned dependencies are present.
+For local folder scans, the scanner can also be run directly:
+
+```powershell
+python scanner.py .\demo_project
+```
+
+OSV lookups need network access when pinned dependencies are present.
 
 ## Local AI Explanations
 
 Ollama is optional. Make sure Ollama is running and the configured model is available, then run:
 
 ```powershell
-python scanner.py .\demo_project --ai
+python scan_repository.py .\demo_project --ai
 ```
 
 AI explanations use the scanner's findings as input. They do not prove that a finding is exploitable or that an application is secure.
@@ -102,7 +120,7 @@ The latest run produced:
 - Code: TP=3, TN=2, FP=0, FN=0.
 - Dependencies: TP=1, TN=1, FP=0, FN=0.
 
-These results describe only the included demo examples; they do not represent the scanner's general accuracy. Dependency benchmark results use live OSV data and require network access.
+These results describe only the included demo examples; they do not represent the scanner's general accuracy. Dependency benchmark results use live OSV data and require network access. GitHub Actions fails the benchmark step if an expected result regresses.
 
 ## GitHub Actions
 
@@ -142,15 +160,18 @@ The dependency draft pull request workflow can propose a reviewable dependency u
 ├── reporting.py
 ├── requirements-auditor.txt
 ├── sarif_reporting.py
+├── scan_repository.py
 └── scanner.py
 ```
 
 ## Scope and Limitations
 
 - This is a prototype that checks selected patterns; it is not a complete replacement for a dedicated SAST or software composition analysis platform.
+- GitHub URL scanning supports public HTTPS repository URLs and scans the default branch.
 - Python code-flow analysis covers selected same-file patterns and calls.
 - JavaScript code-flow analysis covers selected same-file calls and nested closures, plus named relative CommonJS and ESM imports.
 - Dynamic imports, namespace or default imports, Python cross-file flows, and service-to-service data flows are not covered.
 - Dependency scanning depends on supported manifests, package data, and OSV responses.
+- Dependency patch validation checks OSV results but does not run all project-specific tests.
 - Findings and AI explanations need developer review. Passing the included benchmark does not guarantee a codebase is secure.
-- The vulnerable examples are for scanner demonstrations. Do not run them as applications.
+- Vulnerable examples are for scanner demonstrations. Do not run them as applications.
